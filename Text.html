@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tanishq Splash Effect</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #111;
+            font-family: 'Inter', sans-serif;
+        }
+        canvas {
+            display: block;
+        }
+        #info {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: #666;
+            font-size: 12px;
+            pointer-events: none;
+            letter-spacing: 1px;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="info">MOVE CURSOR TO SPLASH</div>
+
+    <!-- Import Three.js as a module -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+
+        // ==========================================
+        // CONFIGURATION & PARAMETERS
+        // ==========================================
+        const CONFIG = {
+            text: "Tanishq is here",
+            font: "900 120px 'Segoe UI', 'Inter', Arial, sans-serif",
+            textColor1: new THREE.Color('#ff0000'), // Red
+            textColor2: new THREE.Color('#ffffff'), // White
+            bgColor: new THREE.Color('#050505'),
+            distortionStrength: 0.4,  // Intensity of the warp
+            cursorRadius: 0.05,       // Size of the splash brush
+            decaySpeed: 0.96,         // 0.0 = instant fade, 1.0 = no fade
+        };
+
+        // ==========================================
+        // SHADERS
+        // ==========================================
+
+        // Vertex Shader (Shared)
+        // Simply passes UVs and Positions to the fragment shader
+        const vertexShader = `
+            varying vec2 vUv;
+            void main() {
+                vUv = uv;
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+            }
+        `;
+
+        // Simulation Fragment Shader
+        // Handles the logic of the "trail" (where the mouse has been)
+        const simFragmentShader = `
+            uniform sampler2D uTexture;   // The previous frame
+            uniform vec2 uMouse;          // Current mouse pos (0 to 1)
+            uniform float uAspect;        // Screen aspect ratio
+            uniform float uRadius;        // Brush size
+            uniform float uDecay;         // Fade speed
+            uniform bool uHasMouse;       // Is mouse active?
+            
+            varying vec2 vUv;
+
+            void main() {
+                // Sample previous frame
+                vec4 oldState = texture2D(uTexture, vUv);
+                
+                // Calculate distance from mouse to current pixel
+                // Correct for aspect ratio to make brush circular, not oval
+                vec2 aspectCorrectedUv = vUv;
+                aspectCorrectedUv.x *= uAspect;
+                
+                vec2 aspectCorrectedMouse = uMouse;
+                aspectCorrectedMouse.x *= uAspect;
+                
+                float dist = distance(aspectCorrectedUv, aspectCorrectedMouse);
+                
+                // Create a soft brush/splash
+                float intensity = 0.0;
+                if(uHasMouse) {
+                    intensity = 1.0 - smoothstep(0.0, uRadius, dist);
+                }
+
+                // Add new splash to old state (accumulate)
+                float newRed = oldState.r + intensity;
+                
+                // Clamp and decay
+                // The red channel stores the "displacement" height
+                newRed = clamp(newRed, 0.0, 2.0) * uDecay;
+
+                gl_FragColor = vec4(newRed, 0.0, 0.0, 1.0);
+            }
+        `;
+
+        // Display Fragment Shader
+        // Takes the simulation result and warps the text
+        const displayFragmentShader = `
+            uniform sampler2D uTextTexture;       // The clean text image
+            uniform sampler2D uDisplacementMap;   // The trail simulation
+            uniform float uStrength;              // Distortion intensity
+            uniform vec3 uColor1;                 // Layer 1 Color
+            uniform vec3 uColor2;                 // Layer 2 Color
+            
+            varying vec2 vUv;
+
+            void main() {
+                // 1. Sample the displacement map (fluid trail)
+                float disp = texture2D(uDisplacementMap, vUv).r;
+                
+                // 2. Calculate distorted UVs
+                // We shift the texture coordinates based on the displacement value
+                // Creates a "refraction" or "smear" look
+                vec2 distortedUv = vUv;
+                distortedUv -= vec2(disp * uStrength * 0.1); 
+
+                // 3. Dual Layer Composition (Chromatic Aberration)
+                // We sample the text twice. 
+                // Layer 1: Slightly offset based on displacement (creates depth)
+                vec4 layer1 = texture2D(uTextTexture, distortedUv + vec2(disp * 0.01, 0.0));
+                
+                // Layer 2: Offset in the opposite direction
+                vec4 layer2 = texture2D(uTextTexture, distortedUv - vec2(disp * 0.01, 0.0));
+
+                // 4. Colorize
+                vec3 finalColor = vec3(0.0);
+                
+                // Additive blending of the two colored layers
+                finalColor += layer1.a * uColor1; 
+                finalColor += layer2.a * uColor2;
+
+                // 5. Background fallback
+                // Simple masking to ensure we see the background color where no text exists
+                float alpha = max(layer1.a, layer2.a);
+                
+                gl_FragColor = vec4(finalColor, alpha);
+            }
+        `;
+
+        // ==========================================
+        // MAIN APP LOGIC
+        // ==========================================
+
+        class App {
+            constructor() {
+                this.container = document.body;
+                this.width = window.innerWidth;
+                this.height = window.innerHeight;
+                this.mouse = new THREE.Vector2(0.5, 0.5);
+                this.hasMouse = false;
+
+                this.init();
+            }
+
+            init() {
+                // 1. WebGL Renderer
+                this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+                this.renderer.setSize(this.width, this.height);
+                this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+                this.container.appendChild(this.renderer.domElement);
+
+                // 2. Scene & Camera
+                this.scene = new THREE.Scene();
+                this.scene.background = CONFIG.bgColor;
+                
+                // Orthographic camera for 2D full-screen effect
+                this.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+                // 3. Create Text Texture
+                this.textTexture = this.createCanvasText();
+
+                // 4. Setup Ping-Pong Buffers (for simulation)
+                this.initSimulation();
+
+                // 5. Setup Main Display Quad
+                this.initDisplay();
+
+                // 6. Events
+                this.addEvents();
+
+                // 7. Start Loop
+                this.render();
+            }
+
+            // Generates a 2D Canvas with centered text and converts to texture
+            createCanvasText() {
+                const canvas = document.createElement('canvas');
+                // Use a reasonable resolution for the text texture
+                canvas.width = 2048; 
+                canvas.height = 1024; 
+                const ctx = canvas.getContext('2d');
+
+                ctx.fillStyle = 'black'; // Transparent logic handled in shader by alpha
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+                ctx.font = CONFIG.font;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillStyle = 'white';
+                
+                ctx.fillText(CONFIG.text, canvas.width / 2, canvas.height / 2);
+
+                const tex = new THREE.CanvasTexture(canvas);
+                tex.needsUpdate = true;
+                // Important for non-power-of-two textures usually, but 2048 is POT.
+                // Linear filter gives smoother distortion results
+                tex.minFilter = THREE.LinearFilter;
+                tex.magFilter = THREE.LinearFilter;
+                return tex;
+            }
+
+            initSimulation() {
+                // We need two buffers to swap between reading and writing (Ping-Pong)
+                const size = 512; // Simulation resolution (doesn't need to be full screen)
+                
+                const options = {
+                    minFilter: THREE.LinearFilter,
+                    magFilter: THREE.LinearFilter,
+                    format: THREE.RGBAFormat,
+                    type: THREE.FloatType, // Float texture for precise physics/decay
+                };
+
+                this.simBufferA = new THREE.WebGLRenderTarget(size, size, options);
+                this.simBufferB = new THREE.WebGLRenderTarget(size, size, options);
+
+                // Scene for the simulation pass
+                this.simScene = new THREE.Scene();
+                this.simMaterial = new THREE.ShaderMaterial({
+                    uniforms: {
+                        uTexture: { value: null },
+                        uMouse: { value: new THREE.Vector2(0.5, 0.5) },
+                        uAspect: { value: this.width / this.height },
+                        uRadius: { value: CONFIG.cursorRadius },
+                        uDecay: { value: CONFIG.decaySpeed },
+                        uForce: { value: 1.0 },
+                        uHasMouse: { value: false }
+                    },
+                    vertexShader: vertexShader,
+                    fragmentShader: simFragmentShader
+                });
+
+                const plane = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.simMaterial);
+                this.simScene.add(plane);
+            }
+
+            initDisplay() {
+                // Material that renders to screen
+                this.displayMaterial = new THREE.ShaderMaterial({
+                    uniforms: {
+                        uTextTexture: { value: this.textTexture },
+                        uDisplacementMap: { value: null }, // Will be fed from sim buffer
+                        uStrength: { value: CONFIG.distortionStrength },
+                        uColor1: { value: CONFIG.textColor1 },
+                        uColor2: { value: CONFIG.textColor2 }
+                    },
+                    vertexShader: vertexShader,
+                    fragmentShader: displayFragmentShader,
+                    transparent: true
+                });
+
+                const plane = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.displayMaterial);
+                this.scene.add(plane);
+            }
+
+            addEvents() {
+                window.addEventListener('resize', this.onResize.bind(this));
+                window.addEventListener('mousemove', this.onMouseMove.bind(this));
+                window.addEventListener('touchmove', (e) => {
+                    e.preventDefault();
+                    this.onMouseMove(e.touches[0]);
+                }, { passive: false });
+            }
+
+            onResize() {
+                this.width = window.innerWidth;
+                this.height = window.innerHeight;
+                this.renderer.setSize(this.width, this.height);
+                
+                // Update aspect ratio uniform for correct brush shape
+                if(this.simMaterial) {
+                    this.simMaterial.uniforms.uAspect.value = this.width / this.height;
+                }
+            }
+
+            onMouseMove(e) {
+                this.hasMouse = true;
+                // Normalize mouse to 0..1
+                this.mouse.x = e.clientX / this.width;
+                this.mouse.y = 1.0 - (e.clientY / this.height); // Invert Y for UVs
+            }
+
+            render() {
+                requestAnimationFrame(this.render.bind(this));
+
+                // --- STEP 1: Simulation Pass ---
+                
+                // Update Simulation Uniforms
+                this.simMaterial.uniforms.uTexture.value = this.simBufferA.texture;
+                this.simMaterial.uniforms.uMouse.value.copy(this.mouse);
+                this.simMaterial.uniforms.uHasMouse.value = this.hasMouse;
+                
+                // Render Simulation to Buffer B
+                this.renderer.setRenderTarget(this.simBufferB);
+                this.renderer.render(this.simScene, this.camera);
+
+                // Swap Buffers (A becomes B, B becomes A)
+                let temp = this.simBufferA;
+                this.simBufferA = this.simBufferB;
+                this.simBufferB = temp;
+
+                // --- STEP 2: Display Pass ---
+
+                // Feed the simulation result (displacement map) to the display shader
+                this.displayMaterial.uniforms.uDisplacementMap.value = this.simBufferA.texture;
+                
+                // Render to Screen
+                this.renderer.setRenderTarget(null);
+                this.renderer.render(this.scene, this.camera);
+            }
+        }
+
+        // Initialize
+        window.onload = () => {
+            new App();
+        };
+
+    </script>
+</body>
+</html>
