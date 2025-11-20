@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Liquid Distortion Reveal</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body, html { margin: 0; padding: 0; overflow: hidden; background-color: #111; }
+        #canvas-container { width: 100vw; height: 100vh; position: relative; z-index: 0; }
+        
+        /* UI Overlay for context */
+        .ui-overlay {
+            position: absolute;
+            bottom: 2rem;
+            left: 2rem;
+            color: white;
+            font-family: 'Inter', sans-serif;
+            pointer-events: none;
+            mix-blend-mode: difference;
+            z-index: 20;
+        }
+        .loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-family: sans-serif;
+            transition: opacity 0.5s;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Large Centered Text -->
+    <div class="absolute top-0 left-0 w-full h-full flex items-center justify-center pointer-events-none z-10 mix-blend-overlay">
+        <h1 class="text-8xl md:text-9xl font-black text-white text-center leading-none tracking-tighter select-none opacity-80">
+            LIQUID<br>DEPTH
+        </h1>
+    </div>
+
+    <div id="canvas-container">
+        <div class="loading" id="loader">Loading Assets...</div>
+    </div>
+
+    <div class="ui-overlay">
+        <h1 class="text-4xl font-bold mb-2">Liquid Trail</h1>
+        <p class="text-sm opacity-80 max-w-md">Move cursor to reveal. <br><strong>Click anywhere to swap layers.</strong></p>
+    </div>
+
+    <!-- Import Three.js from CDN -->
+    <script type="module">
+        import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+
+        // --- CONFIGURATION ---
+        const CONFIG = {
+            frontImage: 'https://images.unsplash.com/photo-1480796927426-f609979314bd?q=80&w=2000&auto=format&fit=crop',
+            backImage: 'https://images.unsplash.com/photo-1550684848-fac1c5b4e853?q=80&w=2000&auto=format&fit=crop',
+            baseRadius: 0.15,    // Base size of the head
+            trailLength: 25,     // Number of points in the tail
+            edgeSoftness: 0.05,  // Sharpness of the liquid edge
+            noiseStrength: 0.03, // Wobbly edges
+            blendStrength: 0.12, // How much the blobs melt into each other (smin factor)
+            dragSpeed: 0.25      // How fast the tail follows (lower = lazier liquid)
+        };
+
+        // --- SHADER CODE ---
+        
+        const vertexShader = `
+            varying vec2 vUv;
+            void main() {
+                vUv = uv;
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+            }
+        `;
+
+        const fragmentShader = `
+            // Define the maximum trail length matching JS
+            #define TRAIL_LENGTH 25
+
+            uniform float uTime;
+            uniform float uAspect;
+            uniform sampler2D uTexFront;
+            uniform sampler2D uTexBack;
+            
+            // The Trail Array
+            uniform vec2 uTrail[TRAIL_LENGTH];
+            
+            uniform float uRadius;
+            uniform float uEdgeSoftness;
+            uniform float uNoiseStrength;
+            uniform float uBlendStrength;
+
+            varying vec2 vUv;
+
+            // --- HELPER FUNCTIONS ---
+
+            // Polynomial Smooth Min (by Inigo Quilez)
+            float smin(float a, float b, float k) {
+                float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+                return mix(b, a, h) - k * h * (1.0 - h);
+            }
+
+            // Simplex Noise
+            vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+            vec2 mod289(vec2 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+            vec3 permute(vec3 x) { return mod289(((x*34.0)+1.0)*x); }
+
+            float snoise(vec2 v) {
+                const vec4 C = vec4(0.211324865405187, 0.366025403784439, -0.577350269189626, 0.024390243902439);
+                vec2 i  = floor(v + dot(v, C.yy) );
+                vec2 x0 = v -   i + dot(i, C.xx);
+                vec2 i1;
+                i1 = (x0.x > x0.y) ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
+                vec4 x12 = x0.xyxy + C.xxzz;
+                x12.xy -= i1;
+                i = mod289(i);
+                vec3 p = permute( permute( i.y + vec3(0.0, i1.y, 1.0 )) + i.x + vec3(0.0, i1.x, 1.0 ));
+                vec3 m = max(0.5 - vec3(dot(x0,x0), dot(x12.xy,x12.xy), dot(x12.zw,x12.zw)), 0.0);
+                m = m*m ;
+                m = m*m ;
+                vec3 x = 2.0 * fract(p * C.www) - 1.0;
+                vec3 h = abs(x) - 0.5;
+                vec3 ox = floor(x + 0.5);
+                vec3 a0 = x - ox;
+                m *= 1.79284291400159 - 0.85373472095314 * ( a0*a0 + h*h );
+                vec3 g;
+                g.x  = a0.x  * x0.x  + h.x  * x0.y;
+                g.yz = a0.yz * x12.xz + h.yz * x12.yw;
+                return 130.0 * dot(m, g);
+            }
+
+            void main() {
+                vec2 aspectCorrectedUV = vUv;
+                aspectCorrectedUV.x *= uAspect;
+
+                // Initialize distance to a large value
+                float d = 10.0;
+                
+                // Iterate through the trail to build the Signed Distance Field (SDF)
+                for (int i = 0; i < TRAIL_LENGTH; i++) {
+                    vec2 point = uTrail[i];
+                    point.x *= uAspect;
+
+                    // Tapering: Make dots smaller as they go back in the array
+                    float progress = float(i) / float(TRAIL_LENGTH);
+                    float currentRadius = uRadius * (1.0 - (progress * 0.8)); // Tail is 20% of head size
+
+                    // Standard Circle SDF: distance(p, center) - radius
+                    float distToPoint = distance(aspectCorrectedUV, point) - currentRadius;
+
+                    // Smoothly blend this point with the existing shape
+                    d = smin(d, distToPoint, uBlendStrength);
+                }
+
+                // Add organic noise to the edge of the SDF
+                float noise = snoise(vUv * 5.0 + uTime * 0.8);
+                float distortedD = d + (noise * uNoiseStrength);
+
+                // Create Mask
+                float mask = 1.0 - smoothstep(-uEdgeSoftness, uEdgeSoftness, distortedD);
+
+                // Distortion for the background image (refraction)
+                vec2 distortedBackUV = vUv + (vec2(noise) * 0.02 * mask);
+
+                // Fetch Colors
+                vec4 texFront = texture2D(uTexFront, vUv);
+                vec4 texBack = texture2D(uTexBack, distortedBackUV);
+
+                // Output
+                gl_FragColor = mix(texFront, texBack, mask);
+            }
+        `;
+
+        class FluidApp {
+            constructor() {
+                this.container = document.getElementById('canvas-container');
+                
+                // Initialize Trail Array (all points start at center)
+                this.trail = new Array(CONFIG.trailLength)
+                    .fill(0)
+                    .map(() => new THREE.Vector2(0.5, 0.5));
+                
+                this.targetMouse = new THREE.Vector2(0.5, 0.5);
+                
+                this.init();
+            }
+
+            async init() {
+                this.scene = new THREE.Scene();
+                this.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
+                this.camera.position.z = 1;
+
+                this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+                this.renderer.setSize(window.innerWidth, window.innerHeight);
+                this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+                this.container.appendChild(this.renderer.domElement);
+
+                const loader = new THREE.TextureLoader();
+                const loadTex = (url) => new Promise(resolve => {
+                    loader.load(url, (tex) => {
+                        tex.minFilter = THREE.LinearFilter;
+                        tex.magFilter = THREE.LinearFilter;
+                        tex.wrapS = THREE.ClampToEdgeWrapping;
+                        tex.wrapT = THREE.ClampToEdgeWrapping;
+                        resolve(tex);
+                    });
+                });
+
+                const [texFront, texBack] = await Promise.all([
+                    loadTex(CONFIG.frontImage),
+                    loadTex(CONFIG.backImage)
+                ]);
+
+                document.getElementById('loader').style.opacity = 0;
+
+                const geometry = new THREE.PlaneGeometry(2, 2);
+                
+                this.material = new THREE.ShaderMaterial({
+                    vertexShader: vertexShader,
+                    fragmentShader: fragmentShader,
+                    uniforms: {
+                        uTime: { value: 0 },
+                        uAspect: { value: window.innerWidth / window.innerHeight },
+                        uTexFront: { value: texFront },
+                        uTexBack: { value: texBack },
+                        uTrail: { value: this.trail }, 
+                        uRadius: { value: CONFIG.baseRadius },
+                        uEdgeSoftness: { value: CONFIG.edgeSoftness },
+                        uNoiseStrength: { value: CONFIG.noiseStrength },
+                        uBlendStrength: { value: CONFIG.blendStrength }
+                    }
+                });
+
+                this.mesh = new THREE.Mesh(geometry, this.material);
+                this.scene.add(this.mesh);
+
+                window.addEventListener('resize', this.onResize.bind(this));
+                window.addEventListener('mousemove', this.onMouseMove.bind(this));
+                window.addEventListener('touchmove', this.onTouchMove.bind(this), { passive: false });
+                
+                // CLICK TO SWAP EVENT
+                window.addEventListener('click', this.onClick.bind(this));
+
+                this.clock = new THREE.Clock();
+                this.animate();
+            }
+
+            onClick() {
+                // Swap the textures in the material uniforms
+                const currentFront = this.material.uniforms.uTexFront.value;
+                const currentBack = this.material.uniforms.uTexBack.value;
+                
+                this.material.uniforms.uTexFront.value = currentBack;
+                this.material.uniforms.uTexBack.value = currentFront;
+            }
+
+            onResize() {
+                const w = window.innerWidth;
+                const h = window.innerHeight;
+                this.renderer.setSize(w, h);
+                this.material.uniforms.uAspect.value = w / h;
+            }
+
+            onMouseMove(e) {
+                this.targetMouse.x = e.clientX / window.innerWidth;
+                this.targetMouse.y = 1.0 - (e.clientY / window.innerHeight);
+            }
+
+            onTouchMove(e) {
+               if(e.touches.length > 0) {
+                   const touch = e.touches[0];
+                   this.targetMouse.x = touch.clientX / window.innerWidth;
+                   this.targetMouse.y = 1.0 - (touch.clientY / window.innerHeight);
+               }
+            }
+
+            animate() {
+                requestAnimationFrame(this.animate.bind(this));
+
+                const time = this.clock.getElapsedTime();
+                this.material.uniforms.uTime.value = time;
+
+                // --- TRAIL PHYSICS (Spring Chain) ---
+                
+                // 1. Head follows mouse (Primary Lerp)
+                const head = this.trail[0];
+                head.x += (this.targetMouse.x - head.x) * 0.15;
+                head.y += (this.targetMouse.y - head.y) * 0.15;
+
+                // 2. Body segments follow the previous segment
+                for (let i = 1; i < this.trail.length; i++) {
+                    const leader = this.trail[i - 1];
+                    const follower = this.trail[i];
+
+                    follower.x += (leader.x - follower.x) * CONFIG.dragSpeed;
+                    follower.y += (leader.y - follower.y) * CONFIG.dragSpeed;
+                }
+                
+                this.renderer.render(this.scene, this.camera);
+            }
+        }
+
+        new FluidApp();
+    </script>
+</body>
+</html>
